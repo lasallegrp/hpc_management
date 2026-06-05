@@ -1,0 +1,8 @@
+++ date '+%Y-%m-%d %H:%M:%S %Z'
++ START_TIME='2026-06-05 10:21:41 PDT'
++ echo ========================================
++ echo 'Job started at: 2026-06-05 10:21:41 PDT'
++ echo 'SLURM job ID: 14983440'
++ echo 'Running on node(s): hive-dc-7-7-62'
++ echo ========================================
++ python3 duplicate_finder.py /quobyte/lasallegrp/ --min 10M --bytes 4096 --skip anaconda --hidden --duplicates --denied

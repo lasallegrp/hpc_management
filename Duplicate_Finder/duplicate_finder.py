@@ -1,136 +1,169 @@
 #!/usr/bin/env python3
 
 import argparse
-import time
-import sys
 import os
+import re
 import stat
-import threading
-import itertools
+import sys
 
-####################
-## Argparse Setup ##
-####################
+def humanify(n):
+	if   n > 1e12: return f'{n/1e12:.2f}T'
+	elif n > 1e9:  return f'{n/1e9:.2f}G'
+	elif n > 1e6:  return f'{n/1e6:.2f}M'
+	elif n > 1e3:  return f'{n/1e3:.2f}K'
+	else:          return n
 
-# Initialize argparse
-parser = argparse.ArgumentParser(
-    description='Find duplicated files within the specified directory')
+def dehuman(s):
+	if   s.endswith('k') or s.endswith('K'): return int(s[:-1]) * 1e3
+	elif s.endswith('m') or s.endswith('M'): return int(s[:-1]) * 1e6
+	elif s.endswith('g') or s.endswith('G'): return int(s[:-1]) * 1e9
+	elif s.endswith('t') or s.endswith('T'): return int(s[:-1]) * 1e12
+	else: return int(s)
 
-# Required arguments
-parser.add_argument('--path', required=True, type=str,
-    metavar='<str>', help='Path to directory')
-
-parser.add_argument('--output', required=True, type=str,
-    metavar='<str>', help='Path to output file')
-    
-# Optional arguments
-parser.add_argument('--min', required=False, default = 1024, type=int, 
-    metavar='<min size>', help='Minimum file size [%(default)s]')
-
-parser.add_argument('--bytes', required=False, default = 128, type=int,
-    metavar='<int>', help='Number of bytes to read for pseudo-checksum [%(default)s]')
-
-# Finalization of argparse
+parser = argparse.ArgumentParser(description='Find duplicate files.')
+parser.add_argument('path', type=str, metavar='<path>')
+parser.add_argument('--min', type=str, metavar='<min size>', default = '10M',
+	help='minimum file size (may use K, M, G, T) [%(default)s]')
+parser.add_argument('--bytes', type=int, metavar='<bytes>', default = 128,
+	help='number of bytes to read for pseudo-checksum [%(default)s]')
+parser.add_argument('--skip', type=str, metavar='<tokens>', nargs='+',
+	help='skip specific tokens, e.g. anaconda')
+parser.add_argument('--duplicates', action='store_true',
+	help='show all duplicte file paths and failed paths')
+parser.add_argument('--denied', action='store_true',
+	help='show all paths that deny permission')
+parser.add_argument('--hidden', action='store_true',
+	help='include hidden (configuration) files and directories')
+parser.add_argument('--progress', action='store_true',
+	help='show progress')
 arg = parser.parse_args()
 
-#################
-## Verify Path ##
-#################
 
-# Verify path exists
-isExist = os.path.exists(arg.path)
-if not isExist:
-    raise AssertionError(f"No such file or directory {arg.path}")
+# Global stats
+failed_paths = {}
+config_files = 0
+config_space = 0
+skip_files = 0
+skip_space = 0
+locked_files = 0
+locked_space = 0
+small_files = 0
+small_space = 0
+check_files = 0
+check_space = 0
 
-# Create output file
-os.system(f'touch {arg.output}')
-    
-###############
-## Threading ##
-###############
 
-def background():
-    for c in itertools.cycle('/-\|'):
-        print(c, end = '\r')
-        time.sleep(0.2)
-        
-def foreground():
+# Index all files by their size
+size = {}
+minsize = dehuman(arg.min)
+filecount = 0
+for path, subdirs, files in os.walk(arg.path):
+	for name in files:
+		filecount += 1
+		if arg.progress: print(f'sizing {filecount}', end='\r', file=sys.stderr)
 
-#########################
-## Retrieve File Sizes ##
-#########################
-    # Initiate timer
-    t0 = time.time()
+		filepath = os.path.join(path, name)
+		try:
+			mode = os.lstat(filepath).st_mode
+		except:
+			if path not in failed_paths: failed_paths[path] = 0
+			failed_paths[path] += 1
+			continue
+		if not stat.S_ISREG(mode): continue
+		s = os.path.getsize(filepath)
 
-    print("Scanning all subdirectories and files and recording sizes...", file = sys.stderr)
-            
-    # Index all files by their size
-    size = {}
-    for path, subdirs, files in os.walk(arg.path):
-        for name in files:
-            filepath = os.path.join(path, name)
-            # Avoid user-specific paths in HPCs and hidden paths
-            if ("usr" not in filepath) and ("/." not in filepath) and ("rlibs" not in filepath) and ("bin" not in filepath):
-                mode = os.lstat(filepath).st_mode
-                if not stat.S_ISREG(mode): continue
-                s = os.path.getsize(filepath)
-                if s < arg.min: continue
-                if s not in size: size[s] = []
-                size[s].append(filepath)
+		# check for hidden files and directories (leading .)
+		if '/.' in filepath and not arg.hidden:
+			config_space += s
+			config_files += 1
+			continue
 
-#####################
-## Find Duplicates ##
-#####################
+		# check for user-specified skip tokens
+		skip = False
+		if arg.skip:
+			for token in arg.skip:
+				if token in filepath:
+					skip = True
+					break
+		if skip:
+			skip_space += s
+			skip_files += 1
+			continue
 
-    print("Calculating psuedo-checksum for potentially duplicated files...", file = sys.stderr)
-            
-    # Find duplicate files (1) by file size (2) by pseudo-checksum
-    for s in sorted(size, reverse=True):    
-        if len(size[s]) == 1: continue
-        
-        # Create a pseudo-checksum by looking at the head and tail of a file
-        pseudosum = {}
-        for filepath in size[s]:
-            with open(filepath, mode='rb') as fp:
-                head = fp.read(arg.bytes)
-                fp.seek(-arg.bytes, 2)
-                tail = fp.read(arg.bytes)
-                sig = (head, tail)
-                if sig not in pseudosum: pseudosum[sig] = []
-                pseudosum[sig].append(filepath)
-        
-        # Report duplicates
-        for sig in pseudosum:
-            if len(pseudosum[sig]) == 1: continue
-            ps = None
-            if   s > 1e12: ps = f'{s/1e12:.2f}T'
-            elif s > 1e9:  ps = f'{s/1e9:.2f}G'
-            elif s > 1e6:  ps = f'{s/1e6:.2f}M'
-            elif s > 1e3:  ps = f'{s/1e3:.2f}K'
-            else:          ps = s
-            with open(arg.output, 'a') as sys.stdout:           
-                print(ps)
-                for x in pseudosum[sig]:
-                    print("\t", x)
+		# check for read permissions - need later for checksum
+		if not os.access(filepath, os.R_OK):
+			locked_space += s
+			locked_files += 1
+			continue
 
-    if not 'pseudosum' in locals():
-        with open(arg.output, 'a') as sys.stdout:           
-            print(f'No duplicates of file sizes greater than {arg.min} bytes found in "{arg.path}"')
-    
-    # End timer
-    t1 = time.time()
-    
-    # Report time
-    print(f"This run took {t1-t0} seconds.", file = sys.stderr)
+		# check for minimum file size
+		if s < minsize:
+			small_space += s
+			small_files += 1
+			continue
+		if s not in size: size[s] = []
+		size[s].append(filepath)
+		check_space += s
+		check_files += 1
+if arg.progress: print(file=sys.stderr)
 
-###############
-## Threading ##
-###############
+# Find duplicate files (1) by file size (2) by pseudo-checksum
+waste_space = 0
+waste_files = 0
+duplicates = []
+filecount = 0
+for s in sorted(size, reverse=True):
+	filecount += 1
+	if arg.progress: print(f'checking {filecount}', end='\r', file=sys.stderr)
 
-b = threading.Thread(name = 'background', target = background)
-b.daemon = True
-f = threading.Thread(name = 'foreground', target = foreground)
+	if len(size[s]) == 1: continue
 
-# Run functions
-b.start()
-f.start()
+	# Create a pseudo-checksum by looking at the head and tail of a file
+	pseudosum = {}
+	for filepath in size[s]:
+		with open(filepath, mode='rb') as fp:
+			head = fp.read(arg.bytes)
+			tail = None
+			if s > arg.bytes:
+				fp.seek(-arg.bytes, 2)
+				tail = fp.read(arg.bytes)
+			sig = (head, tail)
+			if sig not in pseudosum: pseudosum[sig] = []
+			pseudosum[sig].append(filepath)
+
+	# Save duplicates
+	for sig in pseudosum:
+		if len(pseudosum[sig]) == 1: continue
+		duplicates.append( (s, pseudosum[sig]) )
+		waste_space += (len(pseudosum[sig]) -1) * s
+		waste_files += len(pseudosum[sig]) -1
+if arg.progress: print(file=sys.stderr)
+
+# Summary report
+print(f'Hidden Files: {config_files}')
+print(f'Hidden Space: {humanify(config_space)}')
+print(f'Skipped Files: {skip_files}')
+print(f'Skipped Space: {humanify(skip_space)}')
+print(f'Locked Files: {locked_files}')
+print(f'Locked Space: {humanify(locked_space)}')
+print(f'Small Files: {small_files}')
+print(f'Small Space: {humanify(small_space)}')
+print(f'Checked Files: {check_files}')
+print(f'Checked Space: {humanify(check_space)}')
+if check_files != 0 and check_space != 0:
+	print(f'Duplicate Files: {waste_files} ({waste_files/check_files:.3f})')
+	print(f'Duplicate Space: {humanify(waste_space)} ({waste_space/check_space:.3f})')
+
+# Duplicates report
+if arg.duplicates:
+	print('\nDuplicates')
+	for s, files in duplicates:
+		print(humanify(s))
+		for f in files:
+			print(f'\t{f}')
+
+# Denied report
+if arg.denied:
+	print('\nDenied')
+	for path in failed_paths:
+		print(failed_paths[path], path)
